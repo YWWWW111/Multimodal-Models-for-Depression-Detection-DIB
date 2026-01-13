@@ -1,0 +1,69 @@
+{
+    "args": {
+        "dataset": "CMDC",
+        "max_seq_length": 400,
+        "num_text_lines": 12,
+        "train_batch_size": 4,
+        "dev_batch_size": 4,
+        "test_batch_size": 4,
+        "n_epochs": 100,
+        "beta_shift": 1.0,
+        "dropout_prob": 0.5,
+        "model": "bert-base-uncased",
+        "learning_rate": 5e-05,
+        "gradient_accumulation_step": 1,
+        "warmup_proportion": 0.1,
+        "seed": 0
+    },
+    "run_timestamp": "20251210_202355",
+    "individual_fold_results": [
+        {
+            "best_mae": 2.1229772567749023,
+            "best_acc": 1.0,
+            "best_acc_7": 0.75,
+            "best_f_score": 1.0,
+            "best_corr": 0.9491017991052904,
+            "best_multiclass_f1": 0.6016666666666667
+        },
+        {
+            "best_mae": 4.6392645835876465,
+            "best_acc": 0.8125,
+            "best_acc_7": 0.625,
+            "best_f_score": 0.8003246753246753,
+            "best_corr": 0.7049402193379563,
+            "best_multiclass_f1": 0.3817543859649123
+        },
+        {
+            "best_mae": 3.2107107639312744,
+            "best_acc": 0.875,
+            "best_acc_7": 0.6875,
+            "best_f_score": 0.875,
+            "best_corr": 0.7526285404965747,
+            "best_multiclass_f1": 0.5047619047619047
+        },
+        {
+            "best_mae": 3.7460343837738037,
+            "best_acc": 0.8666666666666667,
+            "best_acc_7": 0.7333333333333333,
+            "best_f_score": 0.8499999999999999,
+            "best_corr": 0.7627530789289452,
+            "best_multiclass_f1": 0.3939393939393939
+        },
+        {
+            "best_mae": 2.289726495742798,
+            "best_acc": 1.0,
+            "best_acc_7": 0.8,
+            "best_f_score": 1.0,
+            "best_corr": 0.8900302872731353,
+            "best_multiclass_f1": 0.475
+        }
+    ],
+    "average_results": {
+        "best_mae": 3.201742696762085,
+        "best_acc": 0.9108333333333334,
+        "best_acc_7": 0.7191666666666666,
+        "best_f_score": 0.9050649350649349,
+        "best_corr": 0.8118907850283803,
+        "best_multiclass_f1": 0.4714244702665756
+    }
+}
