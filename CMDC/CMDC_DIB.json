@@ -15,7 +15,6 @@
     "warmup_proportion": 0.1,
     "seed": 0
   },
-  ],
   "average_results": {
     "best_mae": 2.5853783867259823,
     "best_acc": 0.9616666666666667,
