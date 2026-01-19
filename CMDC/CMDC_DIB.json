@@ -18,7 +18,7 @@
   "average_results": {
     "best_mae": 2.5853783867259823,
     "best_acc": 0.9616666666666667,
-    "best_acc_7": 0.7825,
+    "best_acc_5": 0.7825,
     "best_triclass_accuracy": 0.8333333333333333,
     "best_f_score": 0.9564213564213564,
     "best_corr": 0.8761798723234552,
