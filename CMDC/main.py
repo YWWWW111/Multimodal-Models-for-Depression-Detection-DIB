@@ -1,4 +1,4 @@
-﻿from __future__ import absolute_import, division, print_function
+from __future__ import absolute_import, division, print_function
 
 import argparse
 import csv
@@ -10,13 +10,14 @@ import random
 import sys
 import time
 import datetime
-
+from collections import Counter
 from typing import *
 
 from sklearn.metrics import classification_report
-from sklearn.metrics import confusion_matrix
+from sklearn.metrics import confusion_matrix 
 from sklearn.metrics import precision_recall_fscore_support
 from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import mean_squared_error, roc_auc_score, precision_score, recall_score
 from scipy.spatial.distance import pdist, squareform
 
 import numpy as np
@@ -35,6 +36,112 @@ from torch.optim import AdamW
 
 import wandb
 
+
+class InverseFrequencyWeightedL1Loss(nn.Module):
+    def __init__(
+        self,
+        threshold: int = 9,
+        phq_counts: Optional[Dict[float, int]] = None,
+        min_w: float = 0.05,
+        max_w: float = 8.0,
+    ):
+        super().__init__()
+        self.threshold = threshold
+
+        if phq_counts is None:
+            raise ValueError("InverseFrequencyWeightedL1Loss needs phq_counts")
+        counts = [int(phq_counts.get(float(k), 0)) for k in range(24)]
+        nonzero_counts = [c for c in counts if c > 0]
+        if len(nonzero_counts) == 0:
+            raise ValueError("phq_counts 全为 0，无法计算权重")
+
+        total_samples = int(sum(nonzero_counts))
+        num_classes = int(len(nonzero_counts))
+        raw_weights = []
+        for c in counts:
+            if c > 0:
+                raw_weights.append(total_samples / (num_classes * c))
+            else:
+                raw_weights.append(0.0)
+        nz_weights = [w for w in raw_weights if w > 0]
+        mean_w = float(np.mean(nz_weights)) if len(nz_weights) > 0 else 1.0
+        norm_weights = [(w / mean_w) if w > 0 else 0.0 for w in raw_weights]
+        norm_weights = [
+            min(max(w, min_w), max_w) if w > 0 else 0.0
+            for w in norm_weights
+        ]
+
+        self.register_buffer("weight_lut", torch.tensor(norm_weights, dtype=torch.float32))
+
+        print("\n" + "=" * 60)
+        print("逆频率权重分布（仅统计出现过的PHQ + 均值归一化）")
+        print("=" * 60)
+        for phq in range(24):
+            print(f"  PHQ={phq:2d}: 样本数={counts[phq]:4d}, 权重={norm_weights[phq]:.3f}")
+        print("=" * 60 + "\n")
+
+    def forward(self, predictions, targets):
+        preds = predictions.view(-1)
+        t = targets.view(-1)
+
+        idx = torch.round(t).clamp(0, 23).long()
+        w = self.weight_lut[idx]
+
+        l1 = torch.abs(preds - t)
+        weighted_loss = (l1 * w).mean()
+
+        # 预测均值约束
+        mean_penalty = torch.abs(preds.mean() - t.mean()) * 0.15
+
+        # 预测标准差约束
+        pred_std = preds.std()
+        target_std = t.std()
+        std_penalty = torch.relu(target_std * 0.4 - pred_std) * 0.1
+
+        # 范围约束
+        range_penalty = (torch.relu(preds - 27.0).mean() + torch.relu(-preds).mean()) * 0.5
+
+        return weighted_loss + mean_penalty + std_penalty + range_penalty
+
+
+class FocalRegressionLoss(nn.Module):
+    """
+    Focal回归损失：自动给难样本更高权重
+    """
+    def __init__(self, alpha=2.0, beta=1.0):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+
+    def forward(self, predictions, targets):
+        l1_loss = torch.abs(predictions - targets)
+        focal_weight = torch.pow(l1_loss / (l1_loss.max() + 1e-6), self.alpha)
+        weighted_loss = focal_weight * l1_loss * self.beta
+        return weighted_loss.mean()
+
+
+def get_loss_function(loss_type='inverse_freq', threshold=9, phq_counts=None, **kwargs):
+    if loss_type == 'inverse_freq':
+        return InverseFrequencyWeightedL1Loss(
+            threshold=threshold,
+            phq_counts=phq_counts,
+            min_w=0.3,
+            max_w=5.0
+        )
+    elif loss_type == 'focal':
+        return FocalRegressionLoss()
+    elif loss_type == 'mse':
+        return nn.MSELoss()
+    elif loss_type == 'l1':
+        return nn.L1Loss()
+    elif loss_type == 'huber':  # 新增 Huber Loss
+        return nn.HuberLoss(delta=1.0)  # delta=1.0 对异常值鲁棒
+    else:
+        return nn.HuberLoss(delta=1.0)  # 默认用 Huber
+
+# ==================== 结束修改 ====================
+
+
 # 确保CUDA可用
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # 使用第一个GPU
 if torch.cuda.is_available():
@@ -50,58 +157,70 @@ print(f"设备设置为: {DEVICE}")
 from model import DIB
 from global_configs import ACOUSTIC_DIM, VISUAL_DIM, TEXT_DIM
 
-# --- 新增 MultimodalConfig 和 BertConfig 导入 ---
-from transformers import BertConfig
-
 class MultimodalConfig(object):
-    def __init__(self, beta_shift, dropout_prob):
+    def __init__(self, beta_shift, dropout_prob, vib_lambda=1e-4):
         self.beta_shift = beta_shift
         self.dropout_prob = dropout_prob
-# --- 结束新增 ---
+        self.vib_lambda = vib_lambda # [新增]
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--dataset", type=str,
-                    choices=["mosi", "mosei"], default="mosei")
+parser.add_argument("--dataset", type=str, choices=["mosi", "mosei"], default="mosei")
 
-# ============= 修改点 1: 更新数据集路径 =============
-MOSEI_DATASET_ABS_PATH = "/root/DIB_CMDC_TAV_SL_Fusion/datasets/CMDC_Text_CV_SL.pkl"
+DAIC_WOZ_DATASET_PATH = "/root/DIB_DAIC-WOZ/datasets/DAIC_WOZ_sentences.pkl"
 
-# --- 修改点 2: 设置 max_seq_length ---
-parser.add_argument("--max_seq_length", type=int, default=400)
-parser.add_argument("--num_text_lines", type=int, default=12,
-                    help="每个样本包含的独立文本行数（例如12个问题对应的回答），默认为12")
+parser.add_argument("--max_seq_length", type=int, default=50)
+parser.add_argument("--train_batch_size", type=int, default=128)
+parser.add_argument("--dev_batch_size", type=int, default=128)
+parser.add_argument("--valid_batch_size", type=int, default=128)
 
-# 减小 train_batch_size 以增加每个epoch的批次数
-parser.add_argument("--train_batch_size", type=int, default=4)
-parser.add_argument("--dev_batch_size", type=int, default=4)
-parser.add_argument("--valid_batch_size", type=int, default=4)  # 改名为 valid_batch_size
-parser.add_argument("--n_epochs", type=int, default=60)
+parser.add_argument("--n_epochs", type=int, default=150)  # 增加 epochs
 parser.add_argument("--beta_shift", type=float, default=1.0)
-parser.add_argument("--dropout_prob", type=float, default=0.3)
-parser.add_argument(
-    "--model",
-    type=str,
-    choices=["bert-base-uncased"],
-    default="bert-base-uncased",
-)
-parser.add_argument("--learning_rate", type=float, default=1e-3)
+parser.add_argument("--dropout_prob", type=float, default=0.5)
+parser.add_argument("--model", type=str, choices=["bert-base-uncased"], default="bert-base-uncased")
+parser.add_argument("--learning_rate", type=float, default=5e-5)  # 提高学习率
 parser.add_argument("--gradient_accumulation_step", type=int, default=1)
 parser.add_argument("--warmup_proportion", type=float, default=0.1)
 parser.add_argument("--seed", type=int, default=0)
 
+#  VIB Lambda 参数，用于控制正则化强度 
+parser.add_argument("--vib_lambda", type=float, default=1e-4, help="VIB Loss weight (lambda) in Eq. 6")
+
+parser.add_argument(
+    "--loss_type",
+    type=str,
+    choices=["inverse_freq", "l1", "mse", "focal", "huber"],
+    default="huber",
+    help="损失函数类型"
+)
+parser.add_argument("--depression_threshold", type=int, default=9, help="抑郁判定阈值（PHQ分数）")
+
+# 使用固定的训练集标签分布做权重
+parser.add_argument(
+    "--phq_count_source",
+    type=str,
+    choices=["fixed", "train"],
+    default="fixed",
+    help="权重统计来源：fixed=使用预统计分布，train=按当前训练集统计"
+)
+
 args = parser.parse_args()
 
-# --- 新增 set_random_seed 函数定义 ---
+# 固定训练集标签分布（来自你当前的 train 统计）
+TRAIN_LABEL_COUNTS = {
+    0: 3078, 1: 1328, 2: 1521, 3: 1173, 4: 1183, 5: 897,
+    6: 526, 7: 1860, 8: 347, 9: 824, 10: 1314, 11: 840,
+    12: 732, 13: 348, 14: 195, 15: 436, 16: 691, 17: 73,
+    18: 336, 19: 484, 20: 428, 21: 0, 22: 0, 23: 233
+}
+
+
 def set_random_seed(seed):
-    """
-    设置随机种子以确保结果可复现
-    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-# --- 结束新增 ---
+
 
 def return_unk():
     return 0
@@ -112,328 +231,224 @@ def variance_regularized_loss(preds, targets, var_weight=0.01):
     带有方差正则化的损失函数，使用更稳定的方式计算方差惩罚
     """
     mse_loss = nn.MSELoss()(preds, targets)
-    
-    # 检查预测值是否有NaN
+
     if torch.isnan(preds).any():
         print("警告：预测值包含NaN，损失计算受影响")
         return mse_loss
-    
-    # 计算预测值的方差
+
     batch_var = torch.var(preds.view(-1))
-    
-    # 使用更稳定的方式计算方差惩罚
-    # 避免对数，改用直接除法
     var_penalty = var_weight / (batch_var + 1e-4)
-    
-    # 限制方差惩罚的大小，防止数值爆炸
     var_penalty = torch.clamp(var_penalty, 0, 10.0)
-    
     return mse_loss + var_penalty
 
-# ---  prep_for_training 函数定义 ---
-def prep_for_training(num_train_optimization_steps):
+
+def prep_for_training(num_train_optimization_steps, phq_counts):
     """
     准备模型以进行训练
     """
+    # [修改] 传递 vib_lambda args
     multimodal_config = MultimodalConfig(
-        beta_shift=args.beta_shift, dropout_prob=args.dropout_prob
+        beta_shift=args.beta_shift, 
+        dropout_prob=args.dropout_prob,
+        vib_lambda=args.vib_lambda
     )
 
-    # 加载BERT配置，并指定回归任务（num_labels=1）
-    config = BertConfig.from_pretrained(
-        args.model, num_labels=1, finetuning_task=args.dataset
+    config = BertConfig.from_pretrained(args.model, num_labels=1, finetuning_task=args.dataset)
+
+    custom_loss = get_loss_function(
+        loss_type=args.loss_type,
+        threshold=args.depression_threshold,
+        phq_counts=phq_counts
     )
 
-    # 从预训练的BERT模型初始化我们的DIB模型
     model = DIB.from_pretrained(
         args.model,
         config=config,
         multimodal_config=multimodal_config,
+        loss_function=custom_loss
     )
 
     model.to(DEVICE)
-
     return model
-# --- 结束新增 ---
+
 
 def clone_samples(samples: List[Dict]) -> List[Dict]:
-    """深拷贝样本列表以避免修改原始数据"""
-    return [
-        {k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in s.items()}
-        for s in samples
-    ]
+    return [{k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in s.items()} for s in samples]
+
 
 def standardize_modalities(samples: List[Dict], stats: Optional[Dict] = None) -> Dict:
-    """保留原始音频/视觉特征，不做全局归一化"""
     return {}
 
-class CMDCDataset(Dataset):
-    def __init__(self, samples: List[Dict[str, Any]], max_seq_length: int, tokenizer: BertTokenizer, num_text_lines: int):
+
+class DAICDataset(Dataset):
+    def __init__(self, samples: List[Dict[str, Any]], max_seq_length: int, tokenizer: BertTokenizer):
         self.samples = samples
         self.max_seq_length = max_seq_length
         self.tokenizer = tokenizer
-        self.num_text_lines = num_text_lines
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int):
         sample = self.samples[idx]
-        
-        # 获取文本数据，预期是一个包含12个字符串的列表
-        text_list = sample["text"]
-        
-        # 健壮性检查：确保是列表
-        if isinstance(text_list, np.ndarray):
-            text_list = text_list.tolist()
-        if isinstance(text_list, str):
-            text_list = [text_list]
 
-        # 1. 准备数据：确保列表长度为 num_text_lines (12)
-        # 计算有效的行数
-        valid_len = len(text_list)
-        
-        # 构造 line_mask (标记哪些行是真实数据)
-        line_mask = [1] * min(valid_len, self.num_text_lines) + [0] * max(0, self.num_text_lines - valid_len)
-        
-        # 填充文本列表到固定长度 12
-        if valid_len < self.num_text_lines:
-            padded_text_list = text_list + [""] * (self.num_text_lines - valid_len)
-        else:
-            padded_text_list = text_list[:self.num_text_lines]
-
-        # 2. 批量 Tokenize
-        encoded = self.tokenizer(
-            padded_text_list,
+        encoded = self.tokenizer.encode_plus(
+            sample['text'],
+            max_length=self.max_seq_length,
             padding='max_length',
             truncation=True,
-            max_length=self.max_seq_length,
-            return_tensors='pt',
-            add_special_tokens=True
+            return_tensors='pt'
         )
 
-        # 获取结果 Tensor
-        input_ids = encoded['input_ids']
-        attention_mask = encoded['attention_mask']
-        token_type_ids = encoded['token_type_ids']
-        line_mask_tensor = torch.tensor(line_mask, dtype=torch.float)
+        return {
+            'input_ids': encoded['input_ids'].squeeze(0),
+            'attention_mask': encoded['attention_mask'].squeeze(0),
+            'token_type_ids': encoded['token_type_ids'].squeeze(0),
+            'visual': torch.tensor(sample['vision'], dtype=torch.float32),
+            'acoustic': torch.tensor(sample['audio'], dtype=torch.float32),
+            'label_ids': torch.tensor(sample['label'], dtype=torch.float32)
+        }
 
-        # 处理视听特征
-        visual_vec = torch.from_numpy(sample["vision"]).float()
-        acoustic_vec = torch.from_numpy(sample["audio"]).float()
-        line_mask_tensor = torch.tensor(line_mask, dtype=torch.float32)
-        label = torch.tensor(sample["label"], dtype=torch.float32)
-
-        return input_ids, visual_vec, acoustic_vec, attention_mask, token_type_ids, line_mask_tensor, label
 
 def load_data(dataset_name: str) -> Tuple[Dict, str]:
-    """
-    加载CMDC_Text_CV_SL.pkl数据集（由CMDC_Manual_Split.py生成）
-    数据格式: {fold_name: {'train': [...], 'val': [...]}}
-    注意：此数据集只有train和val，没有独立的test集
-    """
-    data_path = MOSEI_DATASET_ABS_PATH
-    
+    data_path = DAIC_WOZ_DATASET_PATH
     try:
-        print(f"尝试加载指定数据集: {data_path}")
-        with open(data_path, "rb") as handle:
-            data = pickle.load(handle)
-        print(f"✅ 成功从 {data_path} 加载数据集")
+        with open(data_path, 'rb') as f:
+            data = pickle.load(f)
+        print(f"成功加载数据集: {data_path}")
+        print(f"  - 数据集包含的split: {list(data.keys())}")
+        for split_name, split_data in data.items():
+            print(f"    * {split_name}: {len(split_data)} 样本")
         return data, data_path
     except FileNotFoundError:
-        print(f"❌ 致命错误: 找不到指定的数据集: {data_path}")
-        print("请确保该文件存在于正确的位置。程序将终止。")
-        raise
+        raise FileNotFoundError(f"数据集文件未找到: {data_path}")
 
-def set_up_data_loader(fold_id: int):
+
+def _build_phq_counts_from_train(train_samples):
+    labels_int = []
+    for s in train_samples:
+        v = float(s["label"])
+        labels_int.append(int(round(v)))
+    counter = Counter(labels_int)
+    return {float(k): int(counter.get(k, 0)) for k in range(24)}
+
+
+def _build_phq_counts_fixed():
+    return {float(k): int(TRAIN_LABEL_COUNTS.get(k, 0)) for k in range(24)}
+
+
+def set_up_data_loader():
     """
-    为指定的折（fold）设置数据加载器。
+    设置 DAIC-WOZ 数据加载器（使用标准train/dev split）
     """
     data, data_path = load_data(args.dataset)
-    
-    current_fold_key = f'fold{fold_id}'
 
-    if current_fold_key not in data:
-        raise ValueError(f"数据集 {data_path} 缺少 {current_fold_key}，请检查数据预处理脚本。")
+    if 'train' not in data or 'dev' not in data:
+        raise ValueError("数据集必须包含 'train' 和 'dev' split")
 
-    print(f"\n{'='*20} FOLD {fold_id} {'='*20}")
-    print(f"为 FOLD {fold_id} 准备数据加载器...")
-    
-    # ✅ 使用CMDC_Manual_Split生成的数据：只有train和val
-    if 'train' not in data[current_fold_key] or 'val' not in data[current_fold_key]:
-         raise ValueError(f"{current_fold_key} 格式错误，必须包含 'train' 和 'val' 键")
+    print(f"\n{'='*20} DAIC-WOZ 数据准备 {'='*20}")
 
-    train_samples_raw = data[current_fold_key]['train']
-    val_samples_raw = data[current_fold_key]['val']
-    
-    print(f"  - 训练集样本数: {len(train_samples_raw)}")
-    print(f"  - 验证集样本数: {len(val_samples_raw)}")
+    train_samples = data['train']
+    dev_samples = data['dev']
+    test_samples = data.get('test', [])
 
-    # 直接使用预处理好的train和val数据
-    train_samples = clone_samples(train_samples_raw)
-    val_samples = clone_samples(val_samples_raw)
+    print(f"  - 训练集样本数: {len(train_samples)}")
+    print(f"  - 验证集样本数: {len(dev_samples)}")
+    if test_samples:
+        print(f"  - 测试集样本数: {len(test_samples)}")
 
-    # 对训练集计算标准化参数，并应用到验证集
-    print("  - 正在对数据进行标准化...")
-    stats = standardize_modalities(train_samples)
-    standardize_modalities(val_samples, stats)
-    print("  - 标准化完成。")
+    # ===== 统计 PHQ 分布（0~23）=====
+    if args.phq_count_source == "fixed":
+        phq_counts = _build_phq_counts_fixed()
+    else:
+        phq_counts = _build_phq_counts_from_train(train_samples)
 
-    # 初始化Tokenizer
     tokenizer = BertTokenizer.from_pretrained(args.model, do_lower_case=True)
 
-    train_dataset = CMDCDataset(train_samples, args.max_seq_length, tokenizer, args.num_text_lines)
-    valid_dataset = CMDCDataset(val_samples, args.max_seq_length, tokenizer, args.num_text_lines)
+    train_dataset = DAICDataset(train_samples, args.max_seq_length, tokenizer)
+    valid_dataset = DAICDataset(dev_samples, args.max_seq_length, tokenizer)
 
     num_train_optimization_steps = (
-        int(
-            len(train_dataset) / args.train_batch_size /
-            args.gradient_accumulation_step
-        )
-        * args.n_epochs
-    )
-    print(f"  - 训练样本数: {len(train_dataset)}")
-    print(f"  - 验证样本数: {len(valid_dataset)}")
-
-    train_dataloader = DataLoader(
-        train_dataset, batch_size=args.train_batch_size, shuffle=True
-    )
-    valid_dataloader = DataLoader(
-        valid_dataset, batch_size=args.valid_batch_size, shuffle=False
+        int(len(train_dataset) / args.train_batch_size / args.gradient_accumulation_step) * args.n_epochs
     )
 
-    # 检查数据结构
-    if len(train_dataset) > 0:
-        sample = train_samples[0]
-        print(f"\n=== 训练样本检查 (FOLD {fold_id}) ===")
-        
-        text_val = sample['text']
-        if isinstance(text_val, list):
-            text_info = f"list of {len(text_val)} items"
-        elif isinstance(text_val, np.ndarray):
-            text_info = f"ndarray shape {text_val.shape}"
-        elif isinstance(text_val, str):
-            text_info = f"string length {len(text_val)}"
-        else:
-            text_info = f"unknown type {type(text_val)}"
-            
-        print(f"text info: {text_info}, audio 形状: {sample['audio'].shape}, vision 形状: {sample['vision'].shape}, label: {sample['label']}")
-    
+    train_dataloader = DataLoader(train_dataset, batch_size=args.train_batch_size, shuffle=True)
+    valid_dataloader = DataLoader(valid_dataset, batch_size=args.valid_batch_size, shuffle=False)
+
     return (
         train_dataloader,
         valid_dataloader,
         num_train_optimization_steps,
+        phq_counts,
     )
+
 
 def train_epoch(model: nn.Module, train_dataloader: DataLoader, optimizer: AdamW, scheduler):
     model.train()
-    tr_loss = 0
-    nb_tr_examples, nb_tr_steps = 0, 0
-    
+    tr_loss = 0.0
+    nb_tr_steps = 0
     max_grad_norm = 1.0
-    
+
     for step, batch in enumerate(tqdm(train_dataloader, desc="Iteration")):
-        # 直接解包新的数据结构，chunk_mask 改名为 line_mask
-        input_ids, visual, acoustic, attention_mask, token_type_ids, line_mask, label_ids = [t.to(DEVICE) for t in batch]
+        input_ids = batch['input_ids'].to(DEVICE)
+        visual = batch['visual'].to(DEVICE)
+        acoustic = batch['acoustic'].to(DEVICE)
+        attention_mask = batch['attention_mask'].to(DEVICE)
+        token_type_ids = batch['token_type_ids'].to(DEVICE)
+        label_ids = batch['label_ids'].to(DEVICE)
 
-        # --- 开始调试代码 ---
-        # 只在第一个批次打印，避免刷屏
-        if step == 0:
-            print(f"\n[DEBUG] 批次 {step} 数据形状:")
-            print(f"  - input_ids: {input_ids.shape}")
-            print(f"  - visual: {visual.shape}")
-            print(f"  - acoustic: {acoustic.shape}")
-            print(f"  - attention_mask: {attention_mask.shape}")
-            print(f"  - token_type_ids: {token_type_ids.shape}")
-            print(f"  - line_mask: {line_mask.shape}")
-            print(f"  - label_ids: {label_ids.shape}")
-            
-            # 检查数据范围
-            print(f"\n[DEBUG] 数据范围检查:")
-            print(f"  - visual min/max: {visual.min().item():.4f} / {visual.max().item():.4f}")
-            print(f"  - acoustic min/max: {acoustic.min().item():.4f} / {acoustic.max().item():.4f}")
-            print(f"  - label_ids min/max: {label_ids.min().item():.4f} / {label_ids.max().item():.4f}")
-            
-            # 检查NaN
-            print(f"\n[DEBUG] NaN检查:")
-            print(f"  - visual contains NaN: {torch.isnan(visual).any().item()}")
-            print(f"  - acoustic contains NaN: {torch.isnan(acoustic).any().item()}")
-            print(f"  - label_ids contains NaN: {torch.isnan(label_ids).any().item()}")
-            
-            # 检查line_mask
-            print(f"\n[DEBUG] line_mask检查:")
-            print(f"  - line_mask示例: {line_mask[0].cpu().numpy()}")
-            print(f"  - 每个样本的有效行数: {line_mask.sum(dim=1).cpu().numpy()}")
-        # --- 结束调试代码 ---
+        loss = model(
+            input_ids,
+            visual,
+            acoustic,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            label_ids=label_ids,
+        )
 
-        # 数据检查并清理
-        visual = torch.nan_to_num(visual)
-        acoustic = torch.nan_to_num(acoustic)
-            
-        # 清除之前的梯度 (使用传入的 optimizer)
-        optimizer.zero_grad()
-        
-        try:
-            # 模型前向传播
-            loss = model(
-                input_ids=input_ids,
-                visual=visual,
-                acoustic=acoustic,
-                attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
-                line_mask=line_mask,
-                label_ids=label_ids
-            )
-            
-            # 反向传播
-            loss.backward()
-            
-            # 梯度裁剪
+        if args.gradient_accumulation_step > 1:
+            loss = loss / args.gradient_accumulation_step
+
+        loss.backward()
+        tr_loss += float(loss.item())
+        nb_tr_steps += 1
+
+        if (step + 1) % args.gradient_accumulation_step == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            
-            # 更新参数
             optimizer.step()
             scheduler.step()
-            
-            tr_loss += loss.item()
-            nb_tr_examples += input_ids.size(0)
-            nb_tr_steps += 1
-            
-        except RuntimeError as e:
-            print(f"训练步骤 {step} 出现运行时错误: {e}")
-            print(f"跳过此批次...")
-            continue
-    
-    return tr_loss / nb_tr_steps if nb_tr_steps > 0 else 0
+            optimizer.zero_grad()
+
+    avg_loss = tr_loss / nb_tr_steps if nb_tr_steps > 0 else 0.0
+    return avg_loss
+
 
 def eval_epoch(model: nn.Module, valid_dataloader: DataLoader):
     model.eval()
-    valid_loss = 0
-    nb_valid_examples, nb_valid_steps = 0, 0
+    valid_loss = 0.0
+    nb_valid_steps = 0
     with torch.no_grad():
         for step, batch in enumerate(tqdm(valid_dataloader, desc="Validation")):
-            input_ids, visual, acoustic, attention_mask, token_type_ids, line_mask, label_ids = [t.to(DEVICE) for t in batch]
-            
-            visual = torch.nan_to_num(visual)
-            acoustic = torch.nan_to_num(acoustic)
-            
+            input_ids = batch['input_ids'].to(DEVICE)
+            visual = batch['visual'].to(DEVICE)
+            acoustic = batch['acoustic'].to(DEVICE)
+            attention_mask = batch['attention_mask'].to(DEVICE)
+            token_type_ids = batch['token_type_ids'].to(DEVICE)
+            label_ids = batch['label_ids'].to(DEVICE)
+
             loss = model(
-                input_ids=input_ids,
-                visual=visual,
-                acoustic=acoustic,
+                input_ids,
+                visual,
+                acoustic,
                 attention_mask=attention_mask,
                 token_type_ids=token_type_ids,
-                line_mask=line_mask,
-                label_ids=label_ids
+                label_ids=label_ids,
             )
-            
-            valid_loss += loss.item()
-            nb_valid_examples += input_ids.size(0)
+
+            valid_loss += float(loss.item())
             nb_valid_steps += 1
 
-    return valid_loss / nb_valid_steps if nb_valid_steps > 0 else 0
-
-
+    return valid_loss / nb_valid_steps if nb_valid_steps > 0 else 0.0
 def valid_epoch(model: nn.Module, valid_dataloader: DataLoader):
     """在验证集上进行预测"""
     model.eval()
@@ -441,129 +456,134 @@ def valid_epoch(model: nn.Module, valid_dataloader: DataLoader):
     labels = []
 
     with torch.no_grad():
-        for batch in tqdm(valid_dataloader, desc="Validation Prediction"):
-            input_ids, visual, acoustic, attention_mask, token_type_ids, line_mask, label_ids = [t.to(DEVICE) for t in batch]
-            
-            visual = torch.nan_to_num(visual)
-            acoustic = torch.nan_to_num(acoustic)
-            
-            logits = model.test(
-                input_ids=input_ids,
-                visual=visual,
-                acoustic=acoustic,
-                attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
-                line_mask=line_mask
+        for step, batch in enumerate(tqdm(valid_dataloader, desc="Validating")):
+            # [修复 1]: 既然 batch 是字典，必须按 key 取值，不能直接循环 .to(DEVICE)
+            input_ids = batch['input_ids'].to(DEVICE)
+            visual = batch['visual'].to(DEVICE)
+            acoustic = batch['acoustic'].to(DEVICE)
+            input_mask = batch['attention_mask'].to(DEVICE)
+            segment_ids = batch['token_type_ids'].to(DEVICE)
+            label_ids = batch['label_ids'].to(DEVICE)
+
+            # 注意：这里我们只传入特征，不传入 label_ids，让模型返回预测值
+            outputs = model(
+                input_ids, 
+                visual, 
+                acoustic, 
+                attention_mask=input_mask, 
+                token_type_ids=segment_ids
             )
             
-            logits = logits.detach().cpu().numpy()
-            label_ids = label_ids.detach().cpu().numpy()
-            
-            preds.extend(logits.flatten().tolist())
-            labels.extend(label_ids.flatten().tolist())
+            # [修复 2]: 解包 model 返回的 tuple (logits, attention_scores)
+            if isinstance(outputs, tuple):
+                logits = outputs[0]
+            else:
+                logits = outputs
 
-        preds = np.array(preds)
-        labels = np.array(labels)
+            logits = logits.detach().cpu().numpy()
+            label_ids = label_ids.to('cpu').numpy()
+
+            preds.append(logits)
+            labels.append(label_ids)
+
+    preds = np.concatenate(preds, axis=0)
+    labels = np.concatenate(labels, axis=0)
 
     return preds, labels
 
 def compute_metrics(preds: np.ndarray, labels: np.ndarray) -> Dict[str, Any]:
-    """统一计算各项评估指标并返回结果"""
     preds = np.asarray(preds).flatten()
     labels = np.asarray(labels).flatten()
 
     metrics = {}
     metrics["mae"] = float(np.mean(np.abs(preds - labels)))
+    metrics["rmse"] = float(np.sqrt(mean_squared_error(labels, preds)))
 
     if preds.std() > 0 and labels.std() > 0:
         metrics["correlation"] = float(np.corrcoef(preds, labels)[0, 1])
     else:
         metrics["correlation"] = 0.0
 
-    # ===== 新增：预测分布诊断 =====
     print(f"\n[预测分布诊断]")
     print(f"  预测值: min={preds.min():.2f}, max={preds.max():.2f}, mean={preds.mean():.2f}, std={preds.std():.2f}")
     print(f"  真实值: min={labels.min():.2f}, max={labels.max():.2f}, mean={labels.mean():.2f}, std={labels.std():.2f}")
     print(f"  预测为负类(PHQ<9): {(preds < 9).sum()}/{len(preds)} ({(preds < 9).mean()*100:.1f}%)")
     print(f"  真实为负类(PHQ<9): {(labels < 9).sum()}/{len(labels)} ({(labels < 9).mean()*100:.1f}%)")
+    print(f"  预测为正类(PHQ≥9): {(preds >= 9).sum()}/{len(preds)} ({(preds >= 9).mean()*100:.1f}%)")
+    print(f"  真实为正类(PHQ≥9): {(labels >= 9).sum()}/{len(labels)} ({(labels >= 9).mean()*100:.1f}%)")
 
-    # 五分类函数
     def phq_bucket(score):
         rounded_score = int(score + 0.5)
         if rounded_score <= 4:
-            return 0      # 0-4: 无抑郁
+            return 0
         if rounded_score <= 9:
-            return 1      # 5-9: 轻度
+            return 1
         if rounded_score <= 14:
-            return 2      # 10-14: 中度
+            return 2
         if rounded_score <= 19:
-            return 3      # 15-19: 中重度
-        return 4      # 20及以上: 重度
+            return 3
+        return 4
 
-    # 三分类函数
     def phq_bucket_3class(score):
         rounded_score = int(score + 0.5)
         if rounded_score <= 4:
-            return 0      # 0-4: 正常
+            return 0
         if rounded_score <= 14:
-            return 1      # 5-14: 轻/中度
-        return 2          # 15-27: 重度
+            return 1
+        return 2
 
-    # 五分类指标
     pred_categories = np.array([phq_bucket(v) for v in preds])
     true_categories = np.array([phq_bucket(v) for v in labels])
 
     metrics["multiclass_accuracy"] = float(np.mean(pred_categories == true_categories))
-    metrics["multiclass_f1_macro"] = float(
-        f1_score(true_categories, pred_categories, average="macro", zero_division=0)
-    )
-    metrics["multiclass_f1_weighted"] = float(
-        f1_score(true_categories, pred_categories, average="weighted", zero_division=0)
-    )
+    metrics["multiclass_f1_macro"] = float(f1_score(true_categories, pred_categories, average="macro", zero_division=0))
+    metrics["multiclass_f1_weighted"] = float(f1_score(true_categories, pred_categories, average="weighted", zero_division=0))
 
-    # 三分类指标
     pred_categories_3class = np.array([phq_bucket_3class(v) for v in preds])
     true_categories_3class = np.array([phq_bucket_3class(v) for v in labels])
 
     metrics["triclass_accuracy"] = float(np.mean(pred_categories_3class == true_categories_3class))
-    metrics["triclass_f1_macro"] = float(
-        f1_score(true_categories_3class, pred_categories_3class, average="macro", zero_division=0)
-    )
-    metrics["triclass_f1_weighted"] = float(
-        f1_score(true_categories_3class, pred_categories_3class, average="weighted", zero_division=0)
-    )
+    metrics["triclass_f1_macro"] = float(f1_score(true_categories_3class, pred_categories_3class, average="macro", zero_division=0))
+    metrics["triclass_f1_weighted"] = float(f1_score(true_categories_3class, pred_categories_3class, average="weighted", zero_division=0))
 
-    # ===== 修改：二分类指标 - 改用macro平均 =====
     pred_binary = preds >= 9
     true_binary = labels >= 9
-    
+
+    # 添加混淆矩阵调试
+    cm = confusion_matrix(true_binary, pred_binary)
+    tn, fp, fn, tp = cm.ravel()
+    print(f"\n[二分类混淆矩阵]")
+    print(f"  TN (真负): {tn}, FP (假正): {fp}")
+    print(f"  FN (假负): {fn}, TP (真正): {tp}")
+    print(f"  正类精确率: {tp / (tp + fp):.4f} (TP / (TP+FP))")
+    print(f"  正类召回率: {tp / (tp + fn):.4f} (TP / (TP+FN))")
+    print(f"  负类精确率: {tn / (tn + fn):.4f} (TN / (TN+FN))")
+    print(f"  负类召回率: {tn / (tn + fp):.4f} (TN / (TN+FP))")
+
     metrics["binary_accuracy"] = float(accuracy_score(true_binary, pred_binary))
-    
-    # 🔥 关键修改：改用 macro 平均
-    metrics["binary_f1_macro"] = float(
-        f1_score(true_binary, pred_binary, average="macro", zero_division=0)
-    )
-    
-    # 保留 weighted 用于对比
-    metrics["binary_f1_weighted"] = float(
-        f1_score(true_binary, pred_binary, average="weighted", zero_division=0)
-    )
-    
-    # 计算每个类别的F1（用于详细分析）
+    metrics["binary_f1_macro"] = float(f1_score(true_binary, pred_binary, average="macro", zero_division=0))
+    metrics["binary_f1_weighted"] = float(f1_score(true_binary, pred_binary, average="weighted", zero_division=0))
+
     f1_per_class = f1_score(true_binary, pred_binary, average=None, zero_division=0)
-    metrics["binary_f1_negative"] = float(f1_per_class[0])  # PHQ<9
-    metrics["binary_f1_positive"] = float(f1_per_class[1])  # PHQ≥9
-    
-    # 🔥 macro
+    metrics["binary_f1_negative"] = float(f1_per_class[0])
+    metrics["binary_f1_positive"] = float(f1_per_class[1])
+
     metrics["binary_f1"] = metrics["binary_f1_macro"]
-    
-    # 打印详细报告
+
+    # 计算 AUROC（使用连续预测作为分数）
+    metrics["auroc"] = float(roc_auc_score(true_binary, preds))
+
+    # 计算 Precision 和 Recall（二分类）
+    metrics["precision"] = float(precision_score(true_binary, pred_binary))
+    metrics["recall"] = float(recall_score(true_binary, pred_binary))
+
     print(f"\n[二分类性能详情]")
     print(f"  负类(PHQ<9) F1: {f1_per_class[0]:.4f}")
     print(f"  正类(PHQ≥9) F1: {f1_per_class[1]:.4f}")
     print(f"  Macro F1 (不加权): {metrics['binary_f1_macro']:.4f}")
     print(f"  Weighted F1 (加权): {metrics['binary_f1_weighted']:.4f}")
     print(f"  准确率: {metrics['binary_accuracy']:.4f}")
+    print(f"  RMSE: {metrics['rmse']:.4f}, AUROC: {metrics['auroc']:.4f}, Precision: {metrics['precision']:.4f}, Recall: {metrics['recall']:.4f}")
 
     metrics["pred_categories"] = pred_categories
     metrics["true_categories"] = true_categories
@@ -573,13 +593,10 @@ def compute_metrics(preds: np.ndarray, labels: np.ndarray) -> Dict[str, Any]:
     metrics["labels"] = labels
     return metrics
 
-# 2. 定义 save_run_artifacts 函数
-def save_run_artifacts(file_prefix, args, metrics, predictions, all_epoch_details):
-    """将运行的产物（参数、指标、预测、各epoch详情）保存到JSON文件"""
-    # 创建保存产物的目录
+
+def save_run_artifacts(file_prefix, args, metrics, predictions, all_epoch_details, best_metrics=None):
     os.makedirs("run_artifacts", exist_ok=True)
 
-    # 辅助函数，用于将numpy类型转换为JSON兼容类型
     def convert_numpy_types(obj):
         if isinstance(obj, np.integer):
             return int(obj)
@@ -593,14 +610,14 @@ def save_run_artifacts(file_prefix, args, metrics, predictions, all_epoch_detail
             return [convert_numpy_types(item) for item in obj]
         return obj
 
-    # 准备要保存的数据
     output_summary = {
         "args": vars(args),
         "summary_metrics": convert_numpy_types(metrics),
         "best_epoch_predictions_sample": convert_numpy_types(predictions),
     }
-    
-    # 保存总体摘要文件
+    if best_metrics:
+        output_summary["best_metrics"] = convert_numpy_types(best_metrics)
+
     summary_path = os.path.join("run_artifacts", f"{file_prefix}_summary.json")
     try:
         with open(summary_path, 'w', encoding='utf-8') as f:
@@ -609,7 +626,6 @@ def save_run_artifacts(file_prefix, args, metrics, predictions, all_epoch_detail
     except Exception as e:
         print(f"❌ 保存运行摘要失败: {e}")
 
-    # 保存每个epoch的详细数据
     details_path = os.path.join("run_artifacts", f"{file_prefix}_epoch_details.json")
     try:
         details_output = {
@@ -624,15 +640,10 @@ def save_run_artifacts(file_prefix, args, metrics, predictions, all_epoch_detail
 
 
 def train(model, train_dataloader, validation_dataloader, num_train_optimization_steps, fold_id, run_timestamp):
-    # 创建保存模型的目录
     os.makedirs("saved_models", exist_ok=True)
-    # 修改模型保存路径以包含 fold_id
     model_save_path = f"saved_models/{args.dataset}_fold_{fold_id}_best_model.pt"
-    
-    # 使用传入的时间戳和 fold_id 构建唯一文件前缀
     file_prefix = f"run_{run_timestamp}_fold_{fold_id}"
-    
-    # 初始化用于收集指标的字典
+
     run_metrics = {
         "epochs": [],
         "train_loss": [],
@@ -643,42 +654,61 @@ def train(model, train_dataloader, validation_dataloader, num_train_optimization
         "valid_f1": [],
         "valid_acc7": [],
         "valid_multiclass_f1": [],
-        "valid_triclass_accuracy": [],      # 新增
-        "valid_triclass_f1": [],            # 新增
+        "valid_triclass_accuracy": [],
+        "valid_triclass_f1": [],
         "best_mae": float('inf'),
         "best_acc": 0.0,
         "best_acc_7": 0.0,
         "best_f_score": 0.0,
         "best_corr": -1.0,
         "best_multiclass_f1": 0.0,
-        "best_triclass_accuracy": 0.0,      # 新增
-        "best_triclass_f1": 0.0             # 新增
+        "best_triclass_accuracy": 0.0,
+        "best_triclass_f1": 0.0,
+        "best_rmse": float('inf'),
+        "best_auroc": 0.0,
+        "best_precision": 0.0,
+        "best_recall": 0.0
     }
-    
-    # 初始化 valid_losses 和 valid_accuracies 列表
+
     valid_losses = []
     valid_accuracies = []
-    
-    # 初始化用于收集预测结果的列表
-    predictions_data = []
-    
-    # 新增：初始化用于收集每个epoch详细信息的列表
     all_epoch_details = []
-    
-    # 在这里创建优化器和学习率调度器
-    optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=0.01, eps=1e-8)
-    warmup_steps = int(0.1 * num_train_optimization_steps)
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer, 
-        num_warmup_steps=warmup_steps,
-        num_training_steps=num_train_optimization_steps
+
+    optimizer_grouped_parameters = [
+        {
+            "params": [p for n, p in model.bert.named_parameters()],
+            "lr": args.learning_rate,
+            "weight_decay": 0.02
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if "bert" not in n],
+            "lr": args.learning_rate * 3,
+            "weight_decay": 0.15
+        }
+    ]
+
+    optimizer = AdamW(optimizer_grouped_parameters, eps=1e-8)
+
+    from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+
+    # 方案1：固定周期（推荐）
+    scheduler = CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=30,  # 每30个epoch重启一次学习率
+        T_mult=1,  # 周期保持不变（每次都是30 epoch）
+        eta_min=args.learning_rate * 0.01  # 最低学习率为初始的1%
     )
-    
-    # --- W&B ---
-    # 使用 wandb.watch() 追踪模型梯度和参数
+
+    # 或方案2：渐进周期（适合更长训练）
+    # scheduler = CosineAnnealingWarmRestarts(
+    #     optimizer,
+    #     T_0=25,  # 第一个周期25 epoch
+    #     T_mult=2,  # 每次重启后周期翻倍（25, 50, 100...）
+    #     eta_min=args.learning_rate * 0.05  # 最低学习率为初始的5%
+    # )
+
     wandb.watch(model, log="all", log_freq=100)
-    
-    # ✅ 修复：添加三分类的最佳指标
+
     best_loss = float('inf')
     best_mae = float('inf')
     best_acc = 0.0
@@ -686,27 +716,28 @@ def train(model, train_dataloader, validation_dataloader, num_train_optimization
     best_f_score = 0.0
     best_corr = -1.0
     best_multiclass_f1 = 0.0
-    best_triclass_accuracy = 0.0  # 新增
-    best_triclass_f1 = 0.0         # 新增
-    
-    # ✅ 新增：早停机制
-    patience = 15
+    best_triclass_accuracy = 0.0
+    best_triclass_f1 = 0.0
+
+    best_rmse = float('inf')
+    best_auroc = 0.0
+    best_precision = 0.0
+    best_recall = 0.0
+
+    patience = 100
     patience_counter = 0
     best_epoch = 0
-    
-    # 记录训练开始时间
+
     start_time = time.time()
-    
+
     for epoch_i in range(int(args.n_epochs)):
         epoch_start_time = time.time()
         train_loss = train_epoch(model, train_dataloader, optimizer, scheduler)
         valid_loss = eval_epoch(model, validation_dataloader)
-        
-        # ✅ 在验证集上计算指标（用于模型选择和早停）
+
         valid_preds, valid_labels = valid_epoch(model, validation_dataloader)
         metric_dict = compute_metrics(valid_preds, valid_labels)
 
-        # 新增：收集当前epoch的详细信息
         current_epoch_details = {
             "epoch": epoch_i,
             "train_loss": train_loss,
@@ -715,7 +746,6 @@ def train(model, train_dataloader, validation_dataloader, num_train_optimization
         }
         all_epoch_details.append(current_epoch_details)
 
-        # ✅ 修复：添加三分类指标到 scalar_metrics
         scalar_metrics = {
             "epoch": epoch_i,
             "train_loss": train_loss,
@@ -723,13 +753,13 @@ def train(model, train_dataloader, validation_dataloader, num_train_optimization
             "mae": metric_dict["mae"],
             "acc": metric_dict["binary_accuracy"],
             "acc7": metric_dict["multiclass_accuracy"],
-            "acc3": metric_dict["triclass_accuracy"],           # 新增
+            "acc3": metric_dict["triclass_accuracy"],
             "binary_f1": metric_dict["binary_f1"],
             "multi_f1": metric_dict["multiclass_f1_macro"],
-            "tri_f1": metric_dict["triclass_f1_macro"],         # 新增
+            "tri_f1": metric_dict["triclass_f1_macro"],
             "corr": metric_dict["correlation"],
             "multiclass_f1_weighted": metric_dict["multiclass_f1_weighted"],
-            "triclass_f1_weighted": metric_dict["triclass_f1_weighted"],  # 新增
+            "triclass_f1_weighted": metric_dict["triclass_f1_weighted"],
             "lr": scheduler.get_last_lr()[0]
         }
 
@@ -741,12 +771,12 @@ def train(model, train_dataloader, validation_dataloader, num_train_optimization
             )
         )
         print(
-            "current mae:{mae:.4f}, acc:{acc:.4f}, acc7:{acc7:.4f}, acc3:{acc3:.4f}, binary_f1:{binary_f1:.4f}, multi_f1:{multi_f1:.4f}, tri_f1:{tri_f1:.4f}, corr:{corr:.4f}".format(
+            "current mae:{mae:.4f}, acc:{acc:.4f}, acc7:{acc7:.4f}, acc3:{acc3:.4f}, "
+            "binary_f1:{binary_f1:.4f}, multi_f1:{multi_f1:.4f}, tri_f1:{tri_f1:.4f}, corr:{corr:.4f}".format(
                 **scalar_metrics
             )
         )
 
-        # --- W&B 日志记录 (只记录标量) ---
         wandb.log(scalar_metrics)
 
         valid_losses.append(valid_loss)
@@ -762,89 +792,136 @@ def train(model, train_dataloader, validation_dataloader, num_train_optimization
             "valid_f1": metric_dict["binary_f1"],
             "valid_acc7": metric_dict["multiclass_accuracy"],
             "valid_multiclass_f1": metric_dict["multiclass_f1_macro"],
-            "valid_triclass_accuracy": metric_dict["triclass_accuracy"],        # 新增
-            "valid_triclass_f1": metric_dict["triclass_f1_macro"],              # 新增
+            "valid_triclass_accuracy": metric_dict["triclass_accuracy"],
+            "valid_triclass_f1": metric_dict["triclass_f1_macro"],
             "epoch_time": epoch_time,
         }
-        
-        # 添加到指标记录中
         run_metrics["epochs"].append(epoch_metrics)
-        
-        # ✅ 修复：早停机制
+
         if valid_loss < best_loss:
             best_loss = valid_loss
             patience_counter = 0
             best_epoch = epoch_i
-            
+
             torch.save(model.state_dict(), model_save_path)
             print(f"🔥 新的最佳验证损失: {best_loss:.4f}，模型已保存到 {model_save_path}")
-            
-            # ✅ 修复：添加三分类指标到 predictions_data
+
+            loss_gap = train_loss - valid_loss
+            if loss_gap > 1.0:
+                print(f"⚠️  训练损失({train_loss:.4f})与验证损失({valid_loss:.4f})差距较大 (gap={loss_gap:.4f})")
+
             predictions_data = {
                 "epoch": epoch_i,
-                "predictions": valid_preds.tolist(),
-                "labels": valid_labels.tolist(),
+                "predictions": valid_preds if isinstance(valid_preds, list) else valid_preds.tolist(),
+                "labels": valid_labels if isinstance(valid_labels, list) else valid_labels.tolist(),
                 "mae": metric_dict["mae"],
                 "acc": metric_dict["binary_accuracy"],
                 "acc7": metric_dict["multiclass_accuracy"],
-                "acc3": metric_dict["triclass_accuracy"],                # 新增
+                "acc3": metric_dict["triclass_accuracy"],
                 "binary_f1": metric_dict["binary_f1"],
                 "multi_f1": metric_dict["multiclass_f1_macro"],
-                "tri_f1": metric_dict["triclass_f1_macro"],              # 新增
-                "corr": metric_dict["correlation"]
+                "tri_f1": metric_dict["triclass_f1_macro"],
+                "corr": metric_dict["correlation"],
+                "rmse": metric_dict["rmse"],  # 添加 rmse
+                "auroc": metric_dict["auroc"],  # 添加 auroc
+                "precision": metric_dict["precision"],  # 添加 precision
+                "recall": metric_dict["recall"]  # 添加 recall
             }
-            
-            save_run_artifacts(file_prefix, args, run_metrics, predictions_data, all_epoch_details)
+
+            best_metrics = {
+                "best_mae": best_mae,
+                "best_rmse": best_rmse,
+                "best_auroc": best_auroc,
+                "best_precision": best_precision,
+                "best_recall": best_recall,
+                "best_acc": best_acc,
+                "best_acc_7": best_acc_7,
+                "best_f_score": best_f_score,
+                "best_corr": best_corr,
+                "best_multiclass_f1": best_multiclass_f1,
+                "best_triclass_accuracy": best_triclass_accuracy,
+                "best_triclass_f1": best_triclass_f1,
+                "best_epoch": best_epoch
+            }
+
+            save_run_artifacts(file_prefix, args, run_metrics, predictions_data, all_epoch_details, best_metrics)
         else:
             patience_counter += 1
             if patience_counter >= patience:
                 print(f"\n⏹ 早停：验证损失在 {patience} 个epoch内未改善（最佳epoch: {best_epoch}）")
                 break
 
-        # 2. 独立检查并更新其他各项最佳指标
-        # MAE: 越小越好
         if metric_dict["mae"] < best_mae:
             best_mae = metric_dict["mae"]
             print(f"  ✨ 新的最佳MAE: {best_mae:.4f}")
-        
-        # Accuracy: 越大越好
+
         if metric_dict["binary_accuracy"] > best_acc:
             best_acc = metric_dict["binary_accuracy"]
             print(f"  ✨ 新的最佳二分类准确率: {best_acc:.4f}")
-        
-        # 7-class Accuracy: 越大越好
+
         if metric_dict["multiclass_accuracy"] > best_acc_7:
             best_acc_7 = metric_dict["multiclass_accuracy"]
             print(f"  ✨ 新的最佳五分类准确率: {best_acc_7:.4f}")
-        
-        # ✅ 新增：三分类最佳指标追踪
+
         if metric_dict["triclass_accuracy"] > best_triclass_accuracy:
             best_triclass_accuracy = metric_dict["triclass_accuracy"]
             print(f"  ✨ 新的最佳三分类准确率: {best_triclass_accuracy:.4f}")
-        
+
         if metric_dict["binary_f1"] > best_f_score:
             best_f_score = metric_dict["binary_f1"]
             print(f"  ✨ 新的最佳F1分数: {best_f_score:.4f}")
-        
-        # Correlation: 越大越好
+
         if metric_dict["correlation"] > best_corr:
             best_corr = metric_dict["correlation"]
             print(f"  ✨ 新的最佳相关系数: {best_corr:.4f}")
-        
-        # Multiclass F1: 越大越好
+
         if metric_dict["multiclass_f1_macro"] > best_multiclass_f1:
             best_multiclass_f1 = metric_dict["multiclass_f1_macro"]
             print(f"  ✨ 新的最佳五分类F1: {best_multiclass_f1:.4f}")
-        
-        # ✅ 新增：三分类F1最佳指标追踪
+
         if metric_dict["triclass_f1_macro"] > best_triclass_f1:
             best_triclass_f1 = metric_dict["triclass_f1_macro"]
             print(f"  ✨ 新的最佳三分类F1: {best_triclass_f1:.4f}")
-    
-    # ✅ 修复：更新 WandB 混淆矩阵
+
+        if metric_dict["rmse"] < best_rmse:
+            best_rmse = metric_dict["rmse"]
+            print(f"  ✨ 新的最佳RMSE: {best_rmse:.4f}")
+
+        if metric_dict["auroc"] > best_auroc:
+            best_auroc = metric_dict["auroc"]
+            print(f"  ✨ 新的最佳AUROC: {best_auroc:.4f}")
+
+        if metric_dict["precision"] > best_precision:
+            best_precision = metric_dict["precision"]
+            print(f"  ✨ 新的最佳Precision: {best_precision:.4f}")
+
+        if metric_dict["recall"] > best_recall:
+            best_recall = metric_dict["recall"]
+            print(f"  ✨ 新的最佳Recall: {best_recall:.4f}")
+
+        if epoch_i % 10 == 0:  # 每10 epoch 打印
+            with torch.no_grad():
+                sample_batch = next(iter(train_dataloader))
+                outputs = model.test(
+                    sample_batch['input_ids'].to(DEVICE),
+                    sample_batch['visual'].to(DEVICE),
+                    sample_batch['acoustic'].to(DEVICE),
+                    attention_mask=sample_batch['attention_mask'].to(DEVICE),
+                    token_type_ids=sample_batch['token_type_ids'].to(DEVICE)
+                )
+                
+                # 解包 outputs
+                if isinstance(outputs, tuple):
+                    preds = outputs[0]
+                else:
+                    preds = outputs
+                    
+                print(f"Epoch {epoch_i} Sample Preds: min={preds.min():.2f}, max={preds.max():.2f}, mean={preds.mean():.2f}")
+       
+
     final_preds, final_labels = valid_epoch(model, validation_dataloader)
-    final_metrics = compute_metrics(final_preds, final_labels)  
-    
+    final_metrics = compute_metrics(final_preds, final_labels)
+
     wandb.log({
         "final_confusion_matrix_5class": wandb.plot.confusion_matrix(
             probs=None,
@@ -863,11 +940,10 @@ def train(model, train_dataloader, validation_dataloader, num_train_optimization
 
     total_time = time.time() - start_time
     print(f"总训练时间: {total_time:.2f}秒, {total_time/60:.2f}分钟")
-    
+
     run_metrics["training_time_seconds"] = float(total_time)
-    run_metrics["best_epoch"] = best_epoch  # 新增
-    
-    # ✅ 修复：返回值包含三分类指标
+    run_metrics["best_epoch"] = best_epoch
+
     return {
         "best_mae": best_mae,
         "best_acc": best_acc,
@@ -875,140 +951,72 @@ def train(model, train_dataloader, validation_dataloader, num_train_optimization
         "best_f_score": best_f_score,
         "best_corr": best_corr,
         "best_multiclass_f1": best_multiclass_f1,
-        "best_triclass_accuracy": best_triclass_accuracy,    # 新增
-        "best_triclass_f1": best_triclass_f1,                # 新增
-        "best_epoch": best_epoch                              # 新增
+        "best_triclass_accuracy": best_triclass_accuracy,
+        "best_triclass_f1": best_triclass_f1,
+        "best_epoch": best_epoch,
+        "best_rmse": best_rmse,
+        "best_auroc": best_auroc,
+        "best_precision": best_precision,
+        "best_recall": best_recall
     }
 
+
 def main():
-    # ✅ 修复：完整的随机种子设置
     set_random_seed(args.seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    
+
     run_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    
+
     try:
         wandb.login()
-        wandb.init(project="CMDC_Depression_Detection", name=f"run_{run_timestamp}", config=vars(args))
-        
-        # ✅ 新增：记录模型配置
+        wandb.init(project="DAIC_WOZ_Depression_Detection", name=f"run_{run_timestamp}", config=vars(args))
         wandb.config.update({
-            "hidden_dim": 256,
+            "hidden_dim": 128,
             "fusion_dim": TEXT_DIM + ACOUSTIC_DIM + VISUAL_DIM,
-            "num_lines": 12,
-            "bert_frozen": True,
+            "text_dim": TEXT_DIM,
+            "acoustic_dim": ACOUSTIC_DIM,
+            "visual_dim": VISUAL_DIM,
         })
     except Exception as e:
         print(f"WandB初始化失败: {e}")
 
     try:
-        data, _ = load_data(args.dataset)
-        expected_folds = [f'fold{i}' for i in range(1, 6)]
-        for fold_key in expected_folds:
-            if fold_key not in data:
-                raise ValueError(f"数据集缺少 {fold_key}")
-        print(f"✅ 数据集完整性检查通过，包含所有5折数据")
-    except Exception as e:
-        print(f"❌ 数据集预检查失败: {e}")
-        return
+        train_dataloader, valid_dataloader, num_train_optimization_steps, phq_counts = set_up_data_loader()
 
-    all_folds_results = []
-    
-    # --- 5折交叉验证循环 ---
-    for fold_id in range(1, 6):
+        model = prep_for_training(num_train_optimization_steps, phq_counts)
+
+        results = train(
+            model=model,
+            train_dataloader=train_dataloader,
+            validation_dataloader=valid_dataloader,
+            num_train_optimization_steps=num_train_optimization_steps,
+            fold_id=1,
+            run_timestamp=run_timestamp
+        )
+
         print(f"\n{'#'*60}")
-        print(f"### 开始训练 FOLD {fold_id} ###")
+        print(f"### 训练完成 ###")
+        print(f"  最佳MAE: {results['best_mae']:.4f}")
+        print(f"  最佳RMSE: {results['best_rmse']:.4f}")
+        print(f"  最佳AUROC: {results['best_auroc']:.4f}")
+        print(f"  最佳Precision: {results['best_precision']:.4f}")
+        print(f"  最佳Recall: {results['best_recall']:.4f}")
+        print(f"  最佳二分类准确率: {results['best_acc']:.4f}")
+        print(f"  最佳五分类准确率: {results['best_acc_7']:.4f}")
+        print(f"  最佳三分类准确率: {results['best_triclass_accuracy']:.4f}")
+        print(f"  最佳F1分数: {results['best_f_score']:.4f}")
+        print(f"  最佳相关系数: {results['best_corr']:.4f}")
+        print(f"  最佳五分类F1: {results['best_multiclass_f1']:.4f}")
+        print(f"  最佳三分类F1: {results['best_triclass_f1']:.4f}")
+        print(f"  最佳epoch: {results['best_epoch']}")
         print(f"{'#'*60}\n")
-        
-        try:
-            # 设置数据加载器
-            train_dataloader, valid_dataloader, num_train_optimization_steps = set_up_data_loader(fold_id)
-            
-            # 准备模型
-            model = prep_for_training(num_train_optimization_steps)
-            
-            # 训练模型
-            fold_results = train(
-                model=model,
-                train_dataloader=train_dataloader,
-                validation_dataloader=valid_dataloader,
-                num_train_optimization_steps=num_train_optimization_steps,
-                fold_id=fold_id,
-                run_timestamp=run_timestamp
-            )
-            
-            fold_results["fold_id"] = fold_id
-            all_folds_results.append(fold_results)
-            
-            # ✅ 修复：添加三分类指标到打印输出
-            print(f"\n{'#'*60}")
-            print(f"### FOLD {fold_id} 训练完成 ###")
-            print(f"  最佳MAE: {fold_results['best_mae']:.4f}")
-            print(f"  最佳二分类准确率: {fold_results['best_acc']:.4f}")
-            print(f"  最佳五分类准确率: {fold_results['best_acc_7']:.4f}")
-            print(f"  最佳三分类准确率: {fold_results['best_triclass_accuracy']:.4f}")  # 新增
-            print(f"  最佳F1分数: {fold_results['best_f_score']:.4f}")
-            print(f"  最佳相关系数: {fold_results['best_corr']:.4f}")
-            print(f"  最佳五分类F1: {fold_results['best_multiclass_f1']:.4f}")
-            print(f"  最佳三分类F1: {fold_results['best_triclass_f1']:.4f}")         # 新增
-            print(f"  最佳epoch: {fold_results['best_epoch']}")                        # 新增
-            print(f"{'#'*60}\n")
-            
-        except Exception as e:
-            print(f"\n❌ FOLD {fold_id} 训练过程中出现错误: {e}")
-            import traceback
-            traceback.print_exc()
-            all_folds_results.append({
-                "fold_id": fold_id,
-                "error": str(e)
-            })
 
-    print(f"\n{'#'*60}")
-    print(f"### 5折交叉验证汇总 ###")
-    print(f"{'#'*60}\n")
-    
-    successful_folds = [r for r in all_folds_results if "error" not in r]
-    
-    if successful_folds:
-        # ✅ 修复：添加三分类指标到平均结果
-        avg_results = {
-            "avg_mae": np.mean([r["best_mae"] for r in successful_folds]),
-            "avg_acc": np.mean([r["best_acc"] for r in successful_folds]),
-            "avg_acc_7": np.mean([r["best_acc_7"] for r in successful_folds]),
-            "avg_triclass_accuracy": np.mean([r["best_triclass_accuracy"] for r in successful_folds]),  # 新增
-            "avg_f_score": np.mean([r["best_f_score"] for r in successful_folds]),
-            "avg_corr": np.mean([r["best_corr"] for r in successful_folds]),
-            "avg_multiclass_f1": np.mean([r["best_multiclass_f1"] for r in successful_folds]),
-            "avg_triclass_f1": np.mean([r["best_triclass_f1"] for r in successful_folds]),            # 新增
-        }
-        
-        print(f"平均MAE: {avg_results['avg_mae']:.4f}")
-        print(f"平均二分类准确率: {avg_results['avg_acc']:.4f}")
-        print(f"平均五分类准确率: {avg_results['avg_acc_7']:.4f}")
-        print(f"平均三分类准确率: {avg_results['avg_triclass_accuracy']:.4f}")  # 新增
-        print(f"平均F1分数: {avg_results['avg_f_score']:.4f}")
-        print(f"平均相关系数: {avg_results['avg_corr']:.4f}")
-        print(f"平均五分类F1: {avg_results['avg_multiclass_f1']:.4f}")
-        print(f"平均三分类F1: {avg_results['avg_triclass_f1']:.4f}")            # 新增
-    else:
-        print("❌ 所有折的训练都失败了，无法计算平均结果")
-        avg_results = "N/A"
+    except Exception as e:
+        print(f"训练过程中出现错误: {e}")
+        import traceback
+        traceback.print_exc()
 
-    # 将最终的平均结果保存到文件
-    final_summary = {
-        "args": vars(args),
-        "run_timestamp": run_timestamp,
-        "individual_fold_results": all_folds_results,
-        "average_results": avg_results if successful_folds else "N/A"
-    }
-    
-    os.makedirs("run_artifacts", exist_ok=True)
-    final_summary_path = os.path.join("run_artifacts", f"run_{run_timestamp}_CV_summary.json")
-    with open(final_summary_path, 'w', encoding='utf-8') as f:
-        json.dump(final_summary, f, indent=2, ensure_ascii=False)
-        
-    print(f"\n✅ 交叉验证最终摘要已保存到: {final_summary_path}")
-    
+
 if __name__ == "__main__":
     main()
